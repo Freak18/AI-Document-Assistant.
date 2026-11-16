@@ -17,11 +17,6 @@ from config import EMBEDDING_DIM, EMBEDDING_MODEL
 from database import DB_ENABLED, SessionLocal
 from trace_log import log
 
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:  # pragma: no cover - optional dependency should degrade gracefully
-    SentenceTransformer = None
-
 WINDOW_WORDS = 300
 OVERLAP_WORDS = 50
 DIM = EMBEDDING_DIM
@@ -118,11 +113,6 @@ def extract_heading_or_title(text: str, filename: str) -> str:
     return clean_name.title()
 
 
-@lru_cache(maxsize=1)
-def _get_sentence_model():
-    if SentenceTransformer is None:
-        raise RuntimeError("sentence-transformers is not installed")
-    return SentenceTransformer(EMBEDDING_MODEL, device="cpu")
 
 
 def chunk_words(text: str, window: int = WINDOW_WORDS, overlap: int = OVERLAP_WORDS) -> list[str]:
@@ -144,30 +134,20 @@ def _bucket(token: str) -> int:
 
 
 def embed_text(text: str) -> np.ndarray:
-    """Return a normalized embedding using the configured Sentence Transformers model."""
+    """Deterministic bag‑of‑hashes embedding (sentence‑transformers removed)."""
     if not text or not text.strip():
         return np.zeros(DIM, dtype=np.float32)
-    try:
-        model = _get_sentence_model()
-        embedding = model.encode(text.strip(), convert_to_numpy=True, normalize_embeddings=True)
-        arr = np.asarray(embedding, dtype=np.float32)
-        if arr.size == 0:
-            return np.zeros(DIM, dtype=np.float32)
-        if arr.shape[0] != DIM:
-            arr = np.resize(arr, DIM).astype(np.float32)
-        return arr
-    except Exception as exc:
-        log(f"[WARN] Sentence-transformers embedding failed; falling back to deterministic bag-of-hashes: {exc}")
-        vector = np.zeros(DIM, dtype=np.float32)
-        tokens = re.findall(r"[a-z0-9]+", text.lower())
-        for index, token in enumerate(tokens):
-            vector[_bucket(token)] += 1.0
-            if index + 1 < len(tokens):
-                vector[_bucket(f"{token}_{tokens[index + 1]}")] += 1.4
-        norm = float(np.linalg.norm(vector))
-        if norm:
-            vector /= norm
-        return vector
+    # Token‑level hashing
+    vector = np.zeros(DIM, dtype=np.float32)
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    for index, token in enumerate(tokens):
+        vector[_bucket(token)] += 1.0
+        if index + 1 < len(tokens):
+            vector[_bucket(f"{token}_{tokens[index + 1]}")] += 1.4
+    norm = float(np.linalg.norm(vector))
+    if norm:
+        vector /= norm
+    return vector
 
 
 CONTENT_STOP = {

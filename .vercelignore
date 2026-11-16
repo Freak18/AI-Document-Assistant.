@@ -14,3 +14,6 @@ frontend.log
 
 # Node modules (Vercel handles its own install)
 node_modules/
+
+# Uploaded files (ephemeral storage)
+backend/uploads/
