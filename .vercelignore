@@ -1,0 +1,16 @@
+# Exclude local development files
+.venv/
+__pycache__/
+*.pyc
+
+# Logs
+backend.log
+frontend.log
+
+# Environment files (local only)
+.env
+.env.local
+.env.example
+
+# Node modules (Vercel handles its own install)
+node_modules/
