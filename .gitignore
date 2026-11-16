@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.dist-info/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Logs
+*.log
+backend.log
+frontend.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.example
+
+# Node modules
+node_modules/
+
+# Build artifacts
+build/
+dist/
+*.egg
+*.egg-info
+*.wheel
+
+# IDE/editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Misc
+*.sqlite3
+*.db
