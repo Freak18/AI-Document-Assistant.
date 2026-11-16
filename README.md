@@ -67,7 +67,7 @@ flowchart TD
 - Alembic: migration and schema management.
 - PyPDF2: PDF page extraction.
 - numpy: embedding vectors and numerical math, plus in-memory fallback retrieval.
-- sentence-transformers: actual embedding model used when available.
+- deterministic bag‑of‑hashes embedding: lightweight, reproducible vector generation without external models.
 - langchain-core: PromptTemplate and tool utilities.
 - langchain-text-splitters: recursive chunking for text windows.
 - langgraph: state machine orchestration for workflow routing.

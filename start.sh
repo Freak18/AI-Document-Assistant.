@@ -94,7 +94,7 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 # 3. Backend dependencies check
-if [ "$FORCE_INSTALL" -eq 1 ] || ! "$PYTHON_BIN" -c "import fastapi, uvicorn, sqlalchemy, pgvector, sentence_transformers, langgraph" >/dev/null 2>&1; then
+if [ "$FORCE_INSTALL" -eq 1 ] || ! "$PYTHON_BIN" -c "import fastapi, uvicorn, sqlalchemy, pgvector, langgraph" >/dev/null 2>&1; then
   echo "Installing / verifying backend dependencies from requirements.txt..."
   "$PYTHON_BIN" -m pip install -r "$BACKEND_DIR/requirements.txt"
 else
