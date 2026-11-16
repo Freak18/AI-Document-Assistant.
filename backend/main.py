@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+import os
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +17,11 @@ from trace_log import latest_id, log, since
 from vector_store import OVERLAP_WORDS, WINDOW_WORDS, store
 from workflow import run_evaluator, run_workflow
 
-UPLOAD_DIR = Path(__file__).with_name("uploads")
+# Determine upload directory – writable on Vercel (/tmp) and safe locally.
+# Use UPLOAD_DIR env var if provided; otherwise default to a local 'uploads' folder.
+default_local = Path(__file__).with_name("uploads")
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/tmp/uploads" if os.getenv("VERCEL") else str(default_local)))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 
