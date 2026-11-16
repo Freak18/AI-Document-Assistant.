@@ -125,7 +125,7 @@ The request passes through two layers before it reaches the RAG workflow:
 This keeps unsafe prompts from reaching document retrieval or the tool layer.
 
 ### 4. Routing logic in LangGraph
-The workflow is implemented as a `StateGraph` in `backend/workflow.py`.
+The workflow is implemented as a `StateGraph` in `backend/workflow.py`
 
 The node flow is:
 
