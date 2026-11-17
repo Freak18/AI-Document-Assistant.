@@ -94,17 +94,28 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 # 3. Backend dependencies check
-if [ "$FORCE_INSTALL" -eq 1 ] || ! "$PYTHON_BIN" -c "import fastapi, uvicorn, sqlalchemy, pgvector, langgraph" >/dev/null 2>&1; then
+if [ "$FORCE_INSTALL" -eq 1 ] || ! "$PYTHON_BIN" -c "import fastapi, uvicorn, sqlalchemy, pgvector, langgraph, openai" >/dev/null 2>&1; then
   echo "Installing / verifying backend dependencies from requirements.txt..."
   "$PYTHON_BIN" -m pip install -r "$BACKEND_DIR/requirements.txt"
 else
   echo "✓ Backend dependencies verified."
 fi
 
-# 4. Load environment variables
-set -a
-source "$ENV_FILE"
-set +a
+# 4. Load environment variables safely (handles unquoted '&' in URLs, CRLF, comments)
+while IFS= read -r line || [ -n "$line" ]; do
+  line="${line%$'\r'}"
+  [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+  if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+    key="${BASH_REMATCH[1]}"
+    val="${BASH_REMATCH[2]}"
+    if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+      val="${BASH_REMATCH[1]}"
+    elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+      val="${BASH_REMATCH[1]}"
+    fi
+    export "$key=$val"
+  fi
+done < "$ENV_FILE"
 
 if [ -z "${DATABASE_URL:-}" ]; then
   echo "[ERROR] DATABASE_URL is not set in backend/.env"
@@ -115,18 +126,7 @@ fi
 DB_HOST="$($PYTHON_BIN -c 'import os; from urllib.parse import urlparse; print((urlparse(os.environ.get("DATABASE_URL", "")).hostname or "").lower())' 2>/dev/null || true)"
 
 if [[ "$DB_HOST" == "localhost" || "$DB_HOST" == "127.0.0.1" || "$DB_HOST" == "postgres" || "$DB_HOST" == "db" ]]; then
-  if command -v docker >/dev/null 2>&1; then
-    echo "Detected local Postgres host ($DB_HOST); starting Docker Postgres container..."
-    docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d postgres
-    echo "Waiting for local Postgres container to be healthy..."
-    until docker compose -f "$SCRIPT_DIR/docker-compose.yml" ps postgres | grep -q "healthy\|running"; do
-      sleep 1
-    done
-    echo "✓ Local PostgreSQL is ready."
-  else
-    echo "[ERROR] DATABASE_URL points to a local Postgres ($DB_HOST), but Docker is not available."
-    exit 1
-  fi
+  echo "✓ Using local PostgreSQL instance ($DB_HOST)."
 else
   echo "✓ Using remote PostgreSQL instance (${DB_HOST:-external})."
 fi

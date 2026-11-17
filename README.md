@@ -30,11 +30,11 @@ flowchart TD
     V --> LLM[Gateway.complete()]
 
     W --> D{Intent classification}
-    D -->|math| A1[Deep Agent calculator]
-    D -->|order| A2[Deep Agent order lookup]
-    D -->|summary/fact| LLM
-
-    LLM --> Eval[Background evaluator]
+    D -->|math / order| A[Deep Agent tool-calling loop]
+    D -->|summary / fact| LLM
+    LLM -->|rag_miss_retry| A
+    LLM -->|answered| Eval[Background evaluator]
+    A --> Eval
     Eval --> DB[(PostgreSQL + pgvector)]
 
     subgraph Data
@@ -71,9 +71,8 @@ flowchart TD
 - langchain-core: PromptTemplate and tool utilities.
 - langchain-text-splitters: recursive chunking for text windows.
 - langgraph: state machine orchestration for workflow routing.
-- openai: OpenAI-compatible client used to call Gemini and OpenRouter endpoints.
+- openai: OpenAI-compatible client used to call Gemini and OpenRouter endpoints (both completions and tool-calling).
 - httpx: general HTTP usage, plus compatibility with provider APIs.
-- langfuse: included in requirements, but the current code path primarily uses the app's own trace log and DB logs rather than active Langfuse instrumentation.
 
 ### Supporting runtime pieces
 - pgvector.sqlalchemy.Vector: vector column mapping for document chunks.
@@ -93,11 +92,10 @@ When a PDF is uploaded through the FastAPI upload route:
 4. Any previously indexed document is cleared with `store.clear_documents()`.
 5. The semantic cache is also flushed with `gateway.clear_cache()`.
 6. `store.ingest_pdf()` parses the file with PyPDF2 and extracts each page's text.
-7. The extracted text is combined and split into overlapping windows using `RecursiveCharacterTextSplitter`.
-8. Each chunk is embedded using `embed_text()`.
-9. If `sentence-transformers` is available, it produces a normalized vector. If not, the app falls back to deterministic bag-of-hashes embedding using a hashed token strategy.
-10. The resulting chunks are stored as `Document` and `DocumentChunk` rows in PostgreSQL, using the pgvector column type.
-11. The newest upload becomes the active document source of truth for retrieval.
+7. The extracted text is combined and split into overlapping windows (`1200` characters, `200` overlap) using `RecursiveCharacterTextSplitter`.
+8. Each chunk is embedded using `embed_text()` (deterministic 384-dim bag-of-hashes embedding, keeping Vercel deployments lightweight).
+9. The resulting chunks are stored as `Document` and `DocumentChunk` rows in PostgreSQL, using the pgvector column type.
+10. The newest upload becomes the active document source of truth for retrieval.
 
 This ensures stale file content does not remain mixed into future answers.
 
@@ -129,11 +127,12 @@ The workflow is implemented as a `StateGraph` in `backend/workflow.py`.
 
 The node flow is:
 
-1. `gateway`
-2. `guardrail`
+1. `gateway` (skips cache on multi-turn follow-ups)
+2. `guardrail` (regex always runs; LLM-as-a-judge runs when `ENABLE_LLM_JUDGE=true`)
 3. `rag_solver`
-4. either `llm` or `agent`
-5. end
+4. `llm` (with `k=8` chunks + recent conversation history) or `agent`
+5. If `llm` returns no match (`rag_miss_retry`), escalates to `agent` for multi-query tool search
+6. end
 
 The classification logic is intentionally simple but practical:
 
@@ -143,11 +142,10 @@ The classification logic is intentionally simple but practical:
 - normal factual questions go through document retrieval and answer generation
 
 ### 5. Retrieval and ranking
-`store.search()` runs semantic retrieval over the active document. The app ranks hits with a hybrid formula based on:
+`store.search()` runs semantic retrieval over the active document (`k=8` in RAG). The app ranks hits with a domain-agnostic hybrid formula based on:
 
-- pgvector cosine similarity
-- lexical overlap between the question and chunk text
-- a field-specific bonus for patterns such as candidate names, titles, compensation data, dates, or order IDs
+- pgvector cosine similarity (`0.45`)
+- lexical overlap between the question and chunk text (`0.55`)
 - recency weighting to prefer the newest uploaded document
 
 Only the current upload is treated as active, which keeps answers anchored to the most recent document rather than stale indexed content.
@@ -165,9 +163,10 @@ The model call is centralized in `backend/gateway.py`:
 
 This keeps the project configurable without scattering LLM calls across modules.
 
-### 7. Deep Agent for operational tasks
-The Deep Agent is used only for tasks that are not document-grounded or that require deterministic operational actions.
+### 7. Deep Agent for operational & multi-query tasks
+`DeepAgent` (`backend/agent.py`) runs an OpenAI-compatible tool-calling loop (`run_async()`) with three tools, falling back to deterministic `run()` in offline/`local-fallback` mode:
 
+- `search_document`: searches the active document with rephrased or alternative queries (triggered on `rag_miss_retry` or multi-step questions)
 - `calculator`: safe AST-based arithmetic evaluator
 - `order_lookup`: queries the `orders` table in PostgreSQL, or falls back to a built-in sample order map
 
@@ -232,9 +231,9 @@ A normal question flow looks like this:
 The app is launched by the project root `start.sh` script, which is responsible for:
 
 - validating Node.js and the Python virtual environment
-- auto-detecting PostgreSQL (Docker local container or remote Neon instance)
+- detecting local or remote PostgreSQL (e.g., Neon)
 - bootstrapping database schema & vector extensions via Alembic
-- running the 44-point architectural test suite
+- running the architectural verification test suite
 - starting the FastAPI backend on port 8000 and polling `/health`
 - starting the Vite React frontend on port 5173
 - opening your default browser automatically

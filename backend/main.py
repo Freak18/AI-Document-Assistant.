@@ -28,6 +28,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_database_ready()
+    store.seed_sample_if_empty()
     gateway.clear_cache()
     log(
         f"[INFO] Vector store ready chunks={store.total_chunks()} "
@@ -57,6 +58,10 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
+    conversation_id: str | None = None
+
+
+_mem_conversations: dict[str, list[dict]] = {}
 
 
 @app.get("/health")
@@ -78,6 +83,27 @@ def metrics() -> dict:
     data = gateway.metrics()
     data["total_chunks"] = store.total_chunks()
     data["db_status"] = db_health()["status"]
+    if DB_ENABLED and SessionLocal is not None and data.get("total_requests", 0) == 0:
+        try:
+            from sqlalchemy import func as sqlfunc
+            from models import Evaluation, LLMUsage
+            db = SessionLocal()
+            try:
+                agg = db.query(
+                    sqlfunc.count(LLMUsage.id),
+                    sqlfunc.coalesce(sqlfunc.sum(LLMUsage.total_tokens), 0),
+                    sqlfunc.coalesce(sqlfunc.sum(LLMUsage.estimated_cost_usd), 0.0),
+                ).first()
+                if agg and agg[0]:
+                    data["tokens_used"] = int(agg[1] or 0)
+                    data["estimated_cost"] = round(float(agg[2] or 0.0), 6)
+                latest_eval = db.query(Evaluation).order_by(Evaluation.created_at.desc()).first()
+                if latest_eval and latest_eval.directness_score is not None:
+                    data["latest_eval_score"] = round(float(latest_eval.directness_score), 2)
+            finally:
+                db.close()
+        except Exception:
+            pass
     return data
 
 
@@ -148,25 +174,64 @@ def _persist_chat_to_db(conversation_id: str, user_message: str, assistant_answe
         log(f"[WARN] Could not persist chat to DB: {exc}")
 
 
+def _load_history(conversation_id: str | None, limit: int = 6) -> list[dict]:
+    """Load recent conversation turns from PostgreSQL or in-memory fallback."""
+    if not conversation_id:
+        return []
+    if DB_ENABLED and SessionLocal is not None:
+        try:
+            db = SessionLocal()
+            try:
+                rows = (
+                    db.query(Message)
+                    .filter_by(conversation_id=conversation_id)
+                    .order_by(Message.created_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+                return [
+                    {"role": r.role, "content": r.content}
+                    for r in reversed(rows)
+                    if r.role in ("user", "assistant")
+                ]
+            finally:
+                db.close()
+        except Exception as exc:
+            log(f"[WARN] Could not load chat history from DB: {exc}")
+    return list(_mem_conversations.get(conversation_id, []))[-limit:]
+
+
 @app.post("/chat")
 async def chat(body: ChatRequest, background: BackgroundTasks) -> dict:
     start = latest_id()
-    result = await run_workflow(body.message.strip())
+    user_message = body.message.strip()
+    conversation_id = body.conversation_id or str(uuid.uuid4())
+    history = _load_history(body.conversation_id)
 
-    conversation_id = str(uuid.uuid4())
+    result = await run_workflow(user_message, history=history)
 
     if result["blocked"]:
         result["nodes"]["eval"] = "skipped"
+    elif os.getenv("VERCEL"):
+        # On serverless Vercel, background tasks may be cut off after response; run inline.
+        await run_evaluator(user_message, result["answer"])
+        result["nodes"]["eval"] = "done"
+        result["trace"] = list(result["trace"]) + ["eval"]
     else:
         result["nodes"]["eval"] = "queued"
         result["trace"] = list(result["trace"]) + ["eval"]
         log("[INFO] Evaluator queued in the background")
-        background.add_task(run_evaluator, body.message.strip(), result["answer"])
+        background.add_task(run_evaluator, user_message, result["answer"])
 
-    # Persist conversation and messages to PostgreSQL
+    # Persist conversation and messages to PostgreSQL and in-memory fallback
     provider = gateway.metrics().get("provider", "unknown")
     model = gateway.metrics().get("model", "unknown")
-    _persist_chat_to_db(conversation_id, body.message.strip(), result.get("answer", ""), provider, model)
+    _persist_chat_to_db(conversation_id, user_message, result.get("answer", ""), provider, model)
+    turns = _mem_conversations.setdefault(conversation_id, [])
+    turns.append({"role": "user", "content": user_message})
+    turns.append({"role": "assistant", "content": result.get("answer", "")})
+    if len(turns) > 20:
+        del turns[: len(turns) - 20]
 
     result["logs"] = since(start)
     m = gateway.metrics()
@@ -193,9 +258,10 @@ async def upload(file: UploadFile = File(...)) -> dict:
     # A new upload becomes the source of truth: drop any older indexed documents before ingesting the file.
     store.clear_documents()
     gateway.clear_cache()
+    _mem_conversations.clear()
 
     try:
-        count, title = store.ingest_pdf(data, name)
+        count, title = store.ingest_pdf(data, name, storage_path=str(dest.resolve()))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not read that PDF: {exc}") from exc
 

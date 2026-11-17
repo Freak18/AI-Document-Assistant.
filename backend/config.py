@@ -48,6 +48,7 @@ LANGFUSE_PUBLIC_KEY: str = os.getenv("LANGFUSE_PUBLIC_KEY", "").strip()
 LANGFUSE_SECRET_KEY: str = os.getenv("LANGFUSE_SECRET_KEY", "").strip()
 LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com").strip()
 
+ENABLE_LLM_JUDGE: bool = os.getenv("ENABLE_LLM_JUDGE", "true").strip().lower() in ("1", "true", "yes")
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("PGVECTOR_DIM", "384")))
 

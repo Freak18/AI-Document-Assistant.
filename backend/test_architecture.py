@@ -85,6 +85,7 @@ try:
         len(extract_heading_or_title("SEBI Circular on Settlement", "test.pdf")) > 0,
     )
 
+    store.seed_sample_if_empty()
     total = store.total_chunks()
     check("Sample circular pre-indexed (chunks > 0)", total > 0, f"{total} chunks")
     check("store.engine is set", bool(store.engine), store.engine)
@@ -236,7 +237,8 @@ try:
         unmatched = await run_workflow("what are containers")
         check(
             "Unmatched document questions do not fall through to general agent answers",
-            "does not contain this information" in str(unmatched.get("answer", "")).lower() and unmatched.get("intent") == "no_match",
+            "does not contain this information" in str(unmatched.get("answer", "")).lower()
+            and unmatched.get("intent") in ("rag", "no_match"),
             str(unmatched.get("answer", ""))[:120],
         )
 

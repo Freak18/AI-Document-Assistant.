@@ -18,7 +18,7 @@ The actual stack is:
 - Backend: FastAPI + Uvicorn
 - Orchestration: LangGraph + langchain-core
 - Retrieval: PostgreSQL + pgvector + SQLAlchemy
-- Embeddings: sentence-transformers with fallback bag-of-hashes
+- Embeddings: deterministic 384-dim bag-of-hashes (`blake2b` token + bigram hashing, Vercel-lightweight)
 - LLM access: OpenAI-compatible client to Gemini/OpenRouter
 - Safety: regex filters + an LLM-as-a-judge gate
 - Tooling: safe calculator + order lookup
@@ -48,8 +48,8 @@ The backend is structured as a FastAPI app with a modular architecture:
 - `backend/gateway.py`: centralized LLM access and cache logic
 - `backend/guardrails.py`: input screening and security judge
 - `backend/workflow.py`: LangGraph orchestration and routing
-- `backend/agent.py`: deterministic operational tools
-- `backend/vector_store.py`: PDF text extraction, chunking, embedding, indexing, and retrieval
+- `backend/agent.py`: LLM tool-calling Deep Agent (`search_document`, `calculator`, `order_lookup`) with deterministic fallback
+- `backend/vector_store.py`: PDF text extraction, chunking (`1200`-char / `200`-overlap), bag-of-hashes embedding, indexing, and retrieval
 
 ### Supporting libraries
 
@@ -59,10 +59,9 @@ The backend is structured as a FastAPI app with a modular architecture:
 - Alembic for migrations and schema bootstrap
 - PyPDF2 for parsing uploaded PDFs
 - numpy for vector math and in-memory fallback search
-- sentence-transformers for embedding generation
-- langchain-core and langgraph for prompt templates and state-machine orchestration
+- langchain-core and langgraph for prompt templates, `@tool` wrappers, and state-machine orchestration
 - langchain-text-splitters for chunk splitting
-- openai Python SDK used through OpenAI-compatible endpoints for Gemini and OpenRouter
+- openai Python SDK (`AsyncOpenAI`) used through OpenAI-compatible endpoints for Gemini and OpenRouter (completions + tool calling)
 - httpx used in the ecosystem and compatibility layer
 
 ---
@@ -111,11 +110,12 @@ The workflow state starts with:
 
 Then the graph executes in this order:
 
-1. `gateway_node`
-2. `guardrail_node`
+1. `gateway_node` (skips cache on multi-turn follow-ups)
+2. `guardrail_node` (regex always runs; LLM judge runs when `ENABLE_LLM_JUDGE=true`)
 3. `rag_solver_node`
-4. either `llm_node` or `agent_node`
-5. end
+4. either `llm_node` (with `k=8` chunks + recent conversation history) or `agent_node`
+5. if `llm_node` finds no match (`rag_miss_retry`), escalates to `agent_node`
+6. end
 
 ---
 
@@ -177,30 +177,23 @@ The vector store is implemented in `backend/vector_store.py`.
 
 ### Embedding strategy
 
-`embed_text()` does the following:
-
-- if `sentence-transformers` is installed, it encodes the text with the configured model
-- the vector is normalized in the same way as typical embedding pipelines
-- if the model fails, it falls back to a deterministic hashing-based vector based on token distribution
-
-This ensures the system can still function even without a fully working local embedding library.
+`embed_text()` generates a normalized 384-dim deterministic bag-of-hashes vector (`blake2b` over unigrams and bigrams), avoiding heavy local ML dependencies such as `sentence-transformers` so the backend deploys cleanly on Vercel.
 
 ### Chunking strategy
 
 The app uses `RecursiveCharacterTextSplitter` with:
 
-- 300-word window
-- 50-word overlap
+- `1200`-character window (`WINDOW_WORDS = 1200`)
+- `200`-character overlap (`OVERLAP_WORDS = 200`)
 
-This keeps chunk boundaries readable while preserving context across nearby sections of a document.
+This keeps related clauses and headings together across nearby sections of any document.
 
 ### Ranking strategy
 
-Retrieval is mixed-rank:
+Retrieval is domain-agnostic mixed-rank:
 
-- vector similarity from pgvector
-- lexical word overlap between the query and chunk text
-- a field bonus for direct patterns like names, dates, amounts, titles, and order references
+- vector similarity from pgvector (`0.45`)
+- lexical word overlap between the query and chunk text (`0.55`)
 - recency boost so newest upload wins
 
 The active document is the newest uploaded source. Older documents are intentionally not allowed to dominate the answer set.
@@ -230,9 +223,12 @@ This distinction is important because the app is designed to answer grounded doc
 
 ---
 
-## 8. Deep Agent and deterministic tools
+## 8. Deep Agent and tools
 
-The Deep Agent is implemented in `backend/agent.py`.
+The Deep Agent is implemented in `backend/agent.py`. When an external LLM is configured, `DeepAgent.run_async()` runs an OpenAI-compatible tool-calling loop (up to 4 iterations) over `search_document`, `calculator`, and `order_lookup`. In `local-fallback` mode, it falls back to deterministic `DeepAgent.run()`.
+
+### Document search (`search_document`)
+Allows `DeepAgent` to re-query the active document with alternative terms or synonyms when initial single-shot RAG returns no match (`rag_miss_retry`) or when a multi-step query needs document facts combined with math.
 
 ### Calculator
 The calculator uses Python’s `ast` module to parse an expression and safely evaluate only numeric operations.

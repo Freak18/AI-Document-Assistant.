@@ -17,8 +17,8 @@ from config import EMBEDDING_DIM, EMBEDDING_MODEL
 from database import DB_ENABLED, SessionLocal
 from trace_log import log
 
-WINDOW_WORDS = 300
-OVERLAP_WORDS = 50
+WINDOW_WORDS = 1200
+OVERLAP_WORDS = 200
 DIM = EMBEDDING_DIM
 
 SAMPLE_CIRCULAR = """\
@@ -167,34 +167,6 @@ def content_tokens(text: str) -> set[str]:
     }
 
 
-def _field_match_bonus(query: str, chunk_text: str) -> float:
-    q = query.lower()
-    text = chunk_text.lower()
-
-    direct_patterns = [
-        ("candidate|employee|applicant|full name|name", r"(?:candidate\s*name|employee\s*name|applicant\s*name|full\s*name|dear\s*\w+|name\s*[:\-])\s*\w+"),
-        ("compensation|salary|ctc|bonus|remuneration|fixed pay|fixed compensation|pay", r"(?:fixed\s*pay|total\s*fixed\s*pay|fixed\s*compensation|annual\s*compensation|salary|basic\s*salary|ctc|base\s*salary|bonus|remuneration)\s*[:\-\s]*(?:inr|\$|rs\.?|[0-9])"),
-        ("designation|role|job title|title|position", r"(?:designation|role|job\s*title|title|position|titlewillbe)\s*[:\-\s]*"),
-        ("joining|join|start date|start|date of joining", r"(?:date\s*of\s*joining|joining\s*date|start\s*date|joining)\s*[:\-\s]*"),
-    ]
-
-    for keywords, pattern in direct_patterns:
-        if any(k in q for k in keywords.split("|")) and re.search(pattern, text):
-            return 0.95
-
-    # Secondary fuzzy word checks (handling joined words from extracted PDF text)
-    if any(k in q for k in ["compensation", "salary", "ctc", "bonus", "remuneration", "fixed pay", "fixed"]):
-        if any(k in text for k in ["totalfixedpay", "fixedpay", "basicsalary", "remuneration", "38,00,000", "fixed pay", "basic salary", "compensation"]):
-            return 0.75
-    if any(k in q for k in ["candidate", "name", "who"]) and any(k in text for k in ["yashwanth", "candidate", "dearyashwanth", "name:"]):
-        return 0.75
-    if any(k in q for k in ["title", "designation", "role", "position"]) and any(k in text for k in ["software engineer", "titlewillbe", "designation"]):
-        return 0.75
-    if any(k in q for k in ["joining", "join", "start date"]) and any(k in text for k in ["joining", "start date", "21-oct-2026"]):
-        return 0.75
-    return 0.0
-
-
 # ---------------------------------------------------------------------------
 # VectorStore class
 # ---------------------------------------------------------------------------
@@ -243,7 +215,13 @@ class VectorStore:
     # ------------------------------------------------------------------
     # Ingestion
     # ------------------------------------------------------------------
-    def ingest_text(self, text: str, source: str) -> tuple[int, str]:
+    def ingest_text(
+        self,
+        text: str,
+        source: str,
+        storage_path: Optional[str] = None,
+        file_size: Optional[int] = None,
+    ) -> tuple[int, str]:
         """Chunk, embed, and store a text document.  Returns (chunk_count, title).
         
         No LLM calls are made.  Uses a database transaction when DB is available.
@@ -256,7 +234,7 @@ class VectorStore:
         embeddings = [embed_text(p) for p in pieces]
 
         if DB_ENABLED and SessionLocal is not None:
-            self._persist_to_db(source, title, pieces, embeddings)
+            self._persist_to_db(source, title, pieces, embeddings, storage_path=storage_path, file_size=file_size)
         else:
             self._persist_in_memory(source, title, pieces, embeddings)
 
@@ -270,7 +248,12 @@ class VectorStore:
         self._active_source = source
         return len(pieces), title
 
-    def ingest_pdf(self, data: bytes, source: str) -> tuple[int, str]:
+    def ingest_pdf(
+        self,
+        data: bytes,
+        source: str,
+        storage_path: Optional[str] = None,
+    ) -> tuple[int, str]:
         """Parse a PDF and ingest its text content with empty-page and extraction safeguards."""
         try:
             reader = PdfReader(BytesIO(data))
@@ -288,7 +271,7 @@ class VectorStore:
         combined = "\n".join(pages).strip()
         if not combined:
             raise ValueError("No extractable text found inside the PDF")
-        return self.ingest_text(combined, source)
+        return self.ingest_text(combined, source, storage_path=storage_path, file_size=len(data))
 
     def _persist_to_db(
         self,
@@ -296,15 +279,20 @@ class VectorStore:
         title: str,
         pieces: list[str],
         embeddings: list[np.ndarray],
+        storage_path: Optional[str] = None,
+        file_size: Optional[int] = None,
     ) -> None:
         """Write a document record and all its chunks to PostgreSQL atomically."""
         from models import Document, DocumentChunk
         import os
 
-        storage_path = str(
+        resolved_path = storage_path or str(
             (
                 __import__("pathlib").Path(__file__).with_name("uploads") / source
             ).resolve()
+        )
+        resolved_size = file_size if file_size is not None else (
+            os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
         )
         doc_id = str(uuid.uuid4())
 
@@ -319,9 +307,9 @@ class VectorStore:
             doc = Document(
                 id=doc_id,
                 filename=source,
-                storage_path=storage_path,
+                storage_path=resolved_path,
                 content_type="application/pdf",
-                file_size=os.path.getsize(storage_path) if os.path.exists(storage_path) else 0,
+                file_size=resolved_size,
                 status="indexing",
                 title=title,
             )
@@ -450,9 +438,8 @@ class VectorStore:
             lexical = (
                 (len(query_terms & chunk_terms) / len(query_terms)) if query_terms else 0.0
             )
-            field_bonus = _field_match_bonus(query, chunk_text)
             recency_boost = self._recency_boost(source)
-            combined = (0.35 * cosine_similarity) + (0.45 * lexical) + field_bonus + recency_boost
+            combined = (0.45 * cosine_similarity) + (0.55 * lexical) + recency_boost
             ranked.append(
                 (
                     combined,
@@ -488,9 +475,8 @@ class VectorStore:
             chunk_text = self._mem_chunks[idx]["text"]
             chunk_terms = content_tokens(chunk_text)
             lexical = (len(query_terms & chunk_terms) / len(query_terms)) if query_terms else 0.0
-            field_bonus = _field_match_bonus(query, chunk_text)
             recency_boost = self._recency_boost(source)
-            combined = (0.25 * score) + (0.55 * lexical) + field_bonus + recency_boost
+            combined = (0.45 * score) + (0.55 * lexical) + recency_boost
             hit = dict(self._mem_chunks[idx])
             hit["score"] = round(score, 4)
             hit["lexical"] = round(lexical, 4)
@@ -570,13 +556,14 @@ class VectorStore:
                 db.close()
         return len(self._mem_chunks)
 
+    def seed_sample_if_empty(self) -> None:
+        """Seed the built-in sample circular only when no documents are indexed yet."""
+        try:
+            if not self.document_stats():
+                _count, _title = self.ingest_text(SAMPLE_CIRCULAR, "sample-market-circular.txt")
+                log(f"[INFO] Pre-indexed sample circular: {_count} chunks (pgvector={DB_ENABLED})")
+        except Exception as exc:
+            log(f"[WARN] Could not pre-index sample circular: {exc}")
+
 
 store = VectorStore()
-
-# Seed a built-in sample circular only when the app is starting with no uploaded material.
-try:
-    if not store.document_stats():
-        _count, _title = store.ingest_text(SAMPLE_CIRCULAR, "sample-market-circular.txt")
-        log(f"[INFO] Pre-indexed sample circular: {_count} chunks (pgvector={DB_ENABLED})")
-except Exception as _e:
-    log(f"[WARN] Could not pre-index sample circular: {_e}")

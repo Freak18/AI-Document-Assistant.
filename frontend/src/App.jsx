@@ -12,6 +12,7 @@ import {
 } from "./api"
 import ArchitectureGraph from "./components/ArchitectureGraph"
 import ChatPanel from "./components/ChatPanel"
+import MetricsBar from "./components/MetricsBar"
 import TerminalConsole from "./components/TerminalConsole"
 import { IDLE_NODES } from "./nodes"
 
@@ -44,6 +45,7 @@ export default function App() {
   const [uploadProgress, setUploadProgress] = useState(0)
   const [uploadStage, setUploadStage] = useState("Preparing upload")
   const [error, setError] = useState("")
+  const [conversationId, setConversationId] = useState(null)
   const logCursor = useRef(0)
 
   useEffect(() => {
@@ -161,7 +163,8 @@ export default function App() {
     ])
 
     try {
-      const data = await sendChat(message)
+      const data = await sendChat(message, conversationId)
+      if (data.conversation_id) setConversationId(data.conversation_id)
       absorbLogs(data.logs)
       setMetrics(data.metrics)
       const resolvedModel =
@@ -231,6 +234,7 @@ export default function App() {
     try {
       const data = await uploadPdf(file)
       await progressLoop
+      setConversationId(null)
       absorbLogs(data.logs)
       setMetrics(data.metrics)
       if (data.title) {
@@ -374,6 +378,7 @@ export default function App() {
 
       {mode === "admin" ? (
         <main className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col gap-4 px-4 pb-4 pt-3">
+          <MetricsBar metrics={metrics} onClearCache={handleClearCache} />
           <aside className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-hidden">
             <div className="flex items-center justify-center rounded-2xl border border-stone-200 bg-white p-1 shadow-sm">
               {[

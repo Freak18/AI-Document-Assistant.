@@ -216,7 +216,7 @@ class LLMGateway:
                         model=self._fallback_model,
                         provider_name=self._fallback_provider,
                     )
-                    self._record_usage(prompt, text_out, self._fallback_provider, purpose, start_ms, cache_hit=False)
+                    self._record_usage(prompt, text_out, self._fallback_provider, purpose, start_ms, cache_hit=False, model=self._fallback_model)
                     log(f"[INFO] Fallback '{self._fallback_provider}' succeeded for {purpose}")
                     return text_out
                 except Exception as fallback_exc:
@@ -225,6 +225,87 @@ class LLMGateway:
             # --- Local fallback as last resort ---
             log(f"[WARN] All providers failed for {purpose}; using local fallback")
             return self._fallback_local(prompt, purpose)
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        purpose: str = "agent",
+    ):
+        """Call the configured LLM provider with OpenAI-compatible tool definitions.
+
+        Returns the assistant message object (with .content and .tool_calls), or None
+        when running in local-fallback mode or if all providers fail.
+        """
+        if self._provider == "local-fallback":
+            return None
+
+        start_ms = time.time() * 1000
+        prompt_text = " ".join(str(m.get("content") or "") for m in messages)
+
+        try:
+            msg = await self._call_openai_compat_tools(
+                messages=messages,
+                tools=tools,
+                api_key=self._api_key,
+                base_url=self._base_url,
+                model=self.model_name,
+            )
+            self._record_usage(
+                prompt_text,
+                msg.content or "[tool_call]",
+                self._provider,
+                purpose,
+                start_ms,
+                cache_hit=False,
+            )
+            return msg
+        except Exception as exc:
+            err_msg = str(exc)
+            log(f"[WARN] Primary provider '{self._provider}' tool-call failed for {purpose}: {err_msg}")
+            if self._fallback_provider and _is_retryable(err_msg):
+                try:
+                    msg = await self._call_openai_compat_tools(
+                        messages=messages,
+                        tools=tools,
+                        api_key=self._fallback_api_key,
+                        base_url=self._fallback_base_url,
+                        model=self._fallback_model,
+                    )
+                    self._record_usage(
+                        prompt_text,
+                        msg.content or "[tool_call]",
+                        self._fallback_provider,
+                        purpose,
+                        start_ms,
+                        cache_hit=False,
+                        model=self._fallback_model,
+                    )
+                    return msg
+                except Exception as fallback_exc:
+                    log(f"[ERROR] Fallback provider '{self._fallback_provider}' tool-call failed: {fallback_exc}")
+            return None
+
+    async def _call_openai_compat_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        api_key: str,
+        base_url: str,
+        model: str,
+    ):
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0,
+            max_tokens=1024,
+        )
+        return response.choices[0].message
 
     async def _call_provider(
         self,
@@ -268,7 +349,9 @@ class LLMGateway:
         purpose: str,
         start_ms: float,
         cache_hit: bool,
+        model: Optional[str] = None,
     ) -> None:
+        resolved_model = model or self.model_name
         in_tokens = estimate_tokens(prompt)
         out_tokens = estimate_tokens(text_out)
         cost = (in_tokens / 1000) * INPUT_USD_PER_1K + (out_tokens / 1000) * OUTPUT_USD_PER_1K
@@ -277,15 +360,16 @@ class LLMGateway:
             self.tokens += in_tokens + out_tokens
             self.cost_usd += cost
         log(
-            f"[INFO] Gateway {purpose} via {provider} "
+            f"[INFO] Gateway {purpose} via {provider} ({resolved_model}) "
             f"tokens={in_tokens + out_tokens} cost=${cost:.6f} latency={latency_ms:.0f}ms"
         )
         # Persist to DB (best-effort, non-blocking)
-        self._persist_usage(provider, purpose, in_tokens, out_tokens, cost, latency_ms, cache_hit)
+        self._persist_usage(provider, resolved_model, purpose, in_tokens, out_tokens, cost, latency_ms, cache_hit)
 
     def _persist_usage(
         self,
         provider: str,
+        model: str,
         purpose: str,
         in_tokens: int,
         out_tokens: int,
@@ -303,7 +387,7 @@ class LLMGateway:
                 record = LLMUsage(
                     id=str(uuid.uuid4()),
                     provider=provider,
-                    model=self.model_name,
+                    model=model,
                     purpose=purpose,
                     input_tokens=in_tokens,
                     output_tokens=out_tokens,
@@ -398,9 +482,6 @@ class LLMGateway:
             return "0.89"
         context = _section(prompt, "Context:")
         question = _section(prompt, "Question:") or prompt
-        direct = _extract_direct_answer(question, context)
-        if direct:
-            return direct
         picked = _best_sentences(question, context)
         if not picked:
             return "No indexed passage matched that question. Upload a PDF to add documents."
@@ -410,30 +491,6 @@ class LLMGateway:
 # ---------------------------------------------------------------------------
 # Sentence-level helpers for local fallback
 # ---------------------------------------------------------------------------
-def _extract_direct_answer(question: str, context: str) -> str:
-    if not context:
-        return ""
-    q = question.lower()
-    wants_name = any(token in q for token in ["name", "candidate", "employee", "applicant", "offered to"])
-    if not wants_name:
-        return ""
-
-    patterns = [
-        r"(?i)\b(?:candidate|employee|applicant|full\s+name|name\s*(?:of\s+the)?\s*(?:candidate|employee|applicant))\s*[:\-]?\s*([A-Z][A-Za-z0-9.'\-]+(?:\s+[A-Z][A-Za-z0-9.'\-]+)+)",
-        r"(?i)\b(?:offered\s+to|offered\s+to\s+candidate|person\s+name)\s*[:\-]?\s*([A-Z][A-Za-z0-9.'\-]+(?:\s+[A-Z][A-Za-z0-9.'\-]+)+)",
-        r"(?i)\bbetween\s+([A-Z][A-Za-z0-9.'\-]+(?:\s+[A-Z][A-Za-z0-9.'\-]+)+)\s+and\s+[A-Z][A-Za-z0-9.'\-]+",
-        r"(?i)\b(?:Mr|Ms|Mrs|Dr)\.?\s+[A-Z][A-Za-z0-9.'\-]+(?:\s+[A-Z][A-Za-z0-9.'\-]+)+",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, context)
-        if match:
-            value = match.group(1).strip(" ,;.")
-            if value and value.lower() not in {"this agreement", "the company", "company", "candidate", "employee", "applicant"}:
-                return f"The candidate name is {value}."
-    return ""
-
-
 def _best_sentences(question: str, context: str) -> list[str]:
     query_terms = content_tokens(question)
     plain = re.sub(r"\[[^\]]+\]", " ", context.replace("\n", " "))
@@ -445,17 +502,7 @@ def _best_sentences(question: str, context: str) -> list[str]:
             continue
         words = content_tokens(cleaned)
         overlap = (len(query_terms & words) / len(query_terms)) if query_terms else 0.0
-        field_bonus = 0.0
-        q_lower = question.lower()
-        if any(token in q_lower for token in ["candidate", "employee", "applicant", "name"]) and re.search(r"\b(?:candidate|employee|applicant|full name|name)\b", cleaned, re.IGNORECASE):
-            field_bonus += 0.5
-        if any(token in q_lower for token in ["compensation", "salary", "ctc", "bonus"]) and re.search(r"\b(?:fixed compensation|annual compensation|salary|ctc|bonus)\b", cleaned, re.IGNORECASE):
-            field_bonus += 0.5
-        if any(token in q_lower for token in ["designation", "role", "title"]) and re.search(r"\b(?:designation|role|job title|title)\b", cleaned, re.IGNORECASE):
-            field_bonus += 0.5
-        if any(token in q_lower for token in ["joining", "join", "start", "date"]) and re.search(r"\b(?:joining date|date of joining|start date|joining)\b", cleaned, re.IGNORECASE):
-            field_bonus += 0.5
-        ranked.append((overlap + field_bonus, -index, cleaned))
+        ranked.append((overlap, -index, cleaned))
     ranked.sort(reverse=True)
     if not ranked or ranked[0][0] <= 0:
         return []

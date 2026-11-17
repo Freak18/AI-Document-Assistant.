@@ -9,6 +9,7 @@ from langchain_core.prompts import PromptTemplate
 from langgraph.graph import END, StateGraph
 
 from agent import agent
+from config import ENABLE_LLM_JUDGE
 from database import DB_ENABLED, SessionLocal
 from gateway import gateway
 from guardrails import guardrails
@@ -18,10 +19,10 @@ from vector_store import store
 
 RAG_PROMPT = PromptTemplate.from_template(
     "You are a careful document Q&A assistant. Answer the user's question using only the provided Context below.\n"
-    "Prioritize exact field values from the document, such as names, dates, amounts, titles, roles, locations, policy numbers, and direct labels.\n"
+    "Match concepts and equivalent phrasing accurately even when the question uses different wording than the document.\n"
     "If the answer is directly stated in the document, return it in one short factual sentence and prefer the exact wording from the document.\n"
     "If the uploaded document does not contain the answer, say 'The uploaded document does not contain this information.' in one clear sentence.\n"
-    "Do not answer from general knowledge or legal boilerplate; use the context only.\n\n"
+    "Do not answer from general knowledge or outside assumptions; use the context only.\n\n"
     "Context:\n{context}\n\n"
     "Question:\n{question}\n"
 )
@@ -44,17 +45,6 @@ def _looks_like_summary_question(prompt: str) -> bool:
     if not text:
         return False
 
-    # Never treat specific factual or field-level inquiries as general document summaries
-    specific_field_keywords = [
-        "compensation", "salary", "ctc", "pay", "fixed", "remuneration", "bonus",
-        "name", "candidate", "who is", "designation", "title", "role", "position",
-        "date", "joining", "when", "location", "probation", "notice", "hours",
-        "settlement", "margin", "penalty", "order", "status", "clause", "cycle",
-        "amount", "inr", "dollar", "how much", "what is the"
-    ]
-    if any(k in text for k in specific_field_keywords):
-        return False
-
     summary_patterns = [
         r"\b(summarize\s+(this|the)|give\s+(me\s+)?a\s+summary|provide\s+(a\s+)?summary|high\s*level\s+summary|overview\s+of\s+(this|the))\b",
         r"\bwhat\s+is\s+(this|the)\s+(document|file|pdf|report|letter|agreement|contract)\s+about\b",
@@ -70,7 +60,6 @@ def _looks_like_summary_question(prompt: str) -> bool:
 
 def _classify_question(prompt: str) -> str:
     # Determine intent of the user query
-    text = prompt.lower()
     if bool(ORDER_INTENT.search(prompt)):
         return "order"
     if bool(MATH_INTENT.search(prompt)):
@@ -78,31 +67,6 @@ def _classify_question(prompt: str) -> str:
     if _looks_like_summary_question(prompt):
         return "summary"
     return "fact"
-# ---------------------------------------------------------------------------
-# Intent‑aware cache helper
-
-
-# ---------------------------------------------------------------------------
-def _answer_satisfies_intent(prompt: str, answer: str) -> bool:
-    """Return True if the cached answer appears to satisfy the intent of *prompt*.
-
-    Uses the same classification as `_classify_question` and simple regexes for
-    common field‑level queries (joining date, compensation, name). For other intents
-    we assume the cached answer is acceptable.
-    """
-    intent = _classify_question(prompt)
-    low_ans = answer.lower()
-    if intent == "joining":
-        # date patterns like "21 Oct 2026" or "21-Oct-2026"
-        return bool(re.search(r"\b\d{1,2}[\s/-][a-z]{3,9}[\s/-]\d{4}\b", low_ans))
-    if intent == "compensation":
-        # monetary amounts – allows commas and optional currency symbols
-        return bool(re.search(r"\b\d{1,3}(,\d{2,3})*(\s*[₹$]?)\b", low_ans))
-    if intent == "name":
-        # simple capitalised name (two words) detection
-        return bool(re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", answer))
-    # For other intents (order, math, fact, summary) we accept the cached answer.
-    return True
 
 
 def _retrieval_confidence(hits: list[dict]) -> tuple[float, float, float]:
@@ -115,19 +79,40 @@ def _retrieval_confidence(hits: list[dict]) -> tuple[float, float, float]:
     return top_score, top_lexical, avg_lexical
 
 
-def _build_rag_prompt(context: str, question: str) -> str:
+def _format_history(history: list[dict] | None) -> str:
+    if not history:
+        return ""
+    lines = []
+    for turn in history[-6:]:
+        role = turn.get("role", "user").capitalize()
+        content = (turn.get("content") or "").strip()
+        if content:
+            lines.append(f"{role}: {content[:500]}")
+    if not lines:
+        return ""
+    return "Conversation History:\n" + "\n".join(lines) + "\n\n"
+
+
+def _build_rag_prompt(context: str, question: str, history: list[dict] | None = None) -> str:
+    history_block = _format_history(history)
     if _looks_like_summary_question(question):
         return (
             "You are a careful document summarizer. Use only the supplied Context below to write a concise summary "
             "of the uploaded document. Mention the document's purpose, core topic, and key ideas in 2-5 short sentences. "
             "Do not say the document does not contain this information when the context is available.\n\n"
-            "Context:\n{context}\n\nQuestion:\n{question}\n"
-        ).format(context=context, question=question)
+            "{history_block}Context:\n{context}\n\nQuestion:\n{question}\n"
+        ).format(history_block=history_block, context=context, question=question)
+    if history_block:
+        return (
+            f"{history_block}"
+            + RAG_PROMPT.format(context=context, question=question)
+        )
     return RAG_PROMPT.format(context=context, question=question)
 
 
 class WorkflowState(TypedDict):
     prompt: str
+    history: list[dict]
     answer: str
     context: str
     nodes: dict[str, str]
@@ -176,18 +161,17 @@ def _persist_workflow_log(request_id: str, node_name: str, status: str, log_mess
 
 async def gateway_node(state: WorkflowState) -> dict:
     gateway.record_request()
+    if state.get("history"):
+        log("[INFO] Gateway skipped semantic cache for multi-turn follow-up")
+        marked = _mark(state, "gateway", "miss", {"score": 0.0, "cached": False, "reason": "multi_turn"})
+        return {**marked, "cached": False}
+
     hit, score = gateway.lookup(state["prompt"])
     if hit:
-        # Verify that the cached answer actually satisfies the request intent
-        if _answer_satisfies_intent(state["prompt"], hit["answer"]):
-            log(f"[INFO] Gateway semantic cache hit similarity={score:.2f}")
-            marked = _mark(state, "gateway", "hit", {"score": round(score, 2), "cached": True})
-            # Propagate the cache hit to the RAG node so downstream nodes see it as active
-            marked = _mark(marked, "rag", "active", {"reason": "cache_hit"})
-            return {**marked, "cached": True, "answer": hit["answer"]}
-        else:
-            log(f"[INFO] Cache hit does not satisfy intent for prompt '{state['prompt']}', falling back to fresh retrieval")
-            # treat as miss – continue to normal RAG path
+        log(f"[INFO] Gateway semantic cache hit similarity={score:.2f}")
+        marked = _mark(state, "gateway", "hit", {"score": round(score, 2), "cached": True})
+        marked = _mark(marked, "rag", "active", {"reason": "cache_hit"})
+        return {**marked, "cached": True, "answer": hit["answer"]}
 
 
     if gateway.cache_size():
@@ -215,6 +199,9 @@ async def guardrail_node(state: WorkflowState) -> dict:
     if state.get("cached"):
         log("[INFO] Guardrail fast-passed cached request without LLM judge call")
         return _mark(state, "guardrail", "pass", {"type": "cached_bypass"})
+
+    if not ENABLE_LLM_JUDGE:
+        return _mark(state, "guardrail", "pass", {"type": "regex"})
 
     log("[INFO] Guardrail regex filter passed; invoking LLM-as-a-Judge...")
     allowed = await guardrails.judge(state["prompt"])
@@ -252,7 +239,7 @@ async def rag_solver_node(state: WorkflowState) -> dict:
         marked = _mark(state, "rag", "escalated", {"solvable": False, "reason": reason, "escalate_to": "deep_agent", "intent": "math"})
         return {**marked, "solvable": False, "escalation_reason": reason, "intent": "math"}
 
-    hits = store.search(prompt, k=5)
+    hits = store.search(prompt, k=8)
     if not hits:
         reason = "no_indexed_document_matches"
         no_match_answer = "The uploaded document does not contain this information."
@@ -270,22 +257,12 @@ async def rag_solver_node(state: WorkflowState) -> dict:
         f"avg_lexical={avg_lexical:.2f} combined={combined_confidence:.2f}"
     )
 
-    if question_kind != "summary" and combined_confidence < 0.12 and top_score < 0.15:
-        reason = "insufficient_grounding"
-        no_match_answer = "The uploaded document does not contain this information."
-        log(f"[INFO] LangGraph RAG solver: grounding is too weak ({combined_confidence:.2f}); returning no-match rather than general knowledge")
-        gateway.remember(prompt, no_match_answer)
-        marked = _mark(state, "rag", "escalated", {"solvable": False, "reason": reason, "top_score": top_score, "intent": "no_match"})
-        return {**marked, "solvable": False, "escalation_reason": reason, "intent": "no_match", "answer": no_match_answer}
-
     if question_kind == "summary":
         log(f"[INFO] LangGraph RAG solver: summary/document-overview query accepted for '{prompt[:80]}'")
-        # Summaries need to be answered from the uploaded document even when the ranking is not extremely strong.
-        # The document itself is the context source, so a moderate match should still use the document rather than a false no-match fallback.
 
     blocks = [
         f"[{hit['source']} chunk {hit['chunk']} similarity={hit['score']:.2f}]\n{hit['text'][:1500]}"
-        for hit in hits[:5]
+        for hit in hits[:8]
     ]
     log(f"[INFO] LangGraph RAG: Retrieved {len(hits)} relevant chunks from {retrieval_source} (top_score={top_score:.2f})")
     for idx, hit in enumerate(hits[:3], 1):
@@ -313,7 +290,7 @@ def route_by_rag_solvability(state: WorkflowState) -> str:
 
 async def llm_node(state: WorkflowState) -> dict:
     context = state["context"]
-    prompt = _build_rag_prompt(context, state["prompt"])
+    prompt = _build_rag_prompt(context, state["prompt"], state.get("history"))
 
     # Log the exact RAG-augmented request payload the LLM is receiving
     context_snippets = []
@@ -335,21 +312,39 @@ async def llm_node(state: WorkflowState) -> dict:
     )
 
     answer = await gateway.complete(prompt, purpose="rag_answer")
+    needs_agent_retry = (
+        gateway._provider != "local-fallback"
+        and "does not contain this information" in answer.lower()
+    )
+    if needs_agent_retry:
+        log("[INFO] Initial RAG pass did not find the answer; escalating to Deep Agent for multi-query search")
+        marked = _mark(state, "llm", "escalated", {"model": gateway.model_name, "reason": "rag_miss_retry"})
+        return {**marked, "answer": answer, "escalation_reason": "rag_miss_retry"}
+
     gateway.remember(state["prompt"], answer)
     log(f"[INFO] Prompt augmented with retrieved document chunks; completed via LLM Gateway ({gateway.model_name})")
     marked = _mark(state, "llm", "active", {"model": gateway.model_name})
     return {**marked, "answer": answer}
 
 
+def route_after_llm(state: WorkflowState) -> str:
+    if state.get("escalation_reason") == "rag_miss_retry":
+        return "deep_agent"
+    return "stop"
+
+
 async def agent_node(state: WorkflowState) -> dict:
     log(f"[INFO] Deep Agent activated autonomously (reason: {state.get('escalation_reason', 'unresolved')})")
     try:
-        answer, tool_name = agent.run(state["prompt"], state.get("intent", "general"))
+        answer, tool_name = await agent.run_async(
+            state["prompt"],
+            state.get("intent", "general"),
+            history=state.get("history"),
+        )
     except Exception as exc:
         answer, tool_name = f"Autonomous tool execution error: {exc}", "error"
 
-    log(f"[INFO] Deep Agent autonomously selected tool: {tool_name}")
-    log("[INFO] Deep Agent returned deterministic tool answer (0 generation tokens used)")
+    log(f"[INFO] Deep Agent selected tool(s): {tool_name}")
     gateway.remember(state["prompt"], answer)
     marked = _mark(state, "agent", "active", {"tool": tool_name, "reason": state.get("escalation_reason")})
     return {**marked, "answer": answer}
@@ -380,7 +375,11 @@ def build_graph():
         {"rag_llm": "llm", "deep_agent": "agent", "stop": END},
     )
 
-    graph.add_edge("llm", END)
+    graph.add_conditional_edges(
+        "llm",
+        route_after_llm,
+        {"deep_agent": "agent", "stop": END},
+    )
     graph.add_edge("agent", END)
     return graph.compile()
 
@@ -388,9 +387,10 @@ def build_graph():
 workflow = build_graph()
 
 
-async def run_workflow(prompt: str) -> dict:
+async def run_workflow(prompt: str, history: list[dict] | None = None) -> dict:
     state: WorkflowState = {
         "prompt": prompt,
+        "history": history or [],
         "answer": "",
         "context": "",
         "nodes": {

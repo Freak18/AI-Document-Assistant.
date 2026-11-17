@@ -8,11 +8,12 @@ async function readJson(response) {
   return body
 }
 
-export function sendChat(message) {
+export function sendChat(message, conversationId = null) {
+  const payload = conversationId ? { message, conversation_id: conversationId } : { message }
   return fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify(payload),
   }).then(readJson)
 }
 
