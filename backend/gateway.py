@@ -297,13 +297,13 @@ class LLMGateway:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        tool_options = {"tools": tools, "tool_choice": "auto"} if tools else {}
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
-            tools=tools,
-            tool_choice="auto",
             temperature=0,
             max_tokens=1024,
+            **tool_options,
         )
         return response.choices[0].message
 

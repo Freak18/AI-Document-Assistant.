@@ -282,7 +282,22 @@ class DeepAgent:
                     result_str = f"Unknown tool: {fn_name}"
                 else:
                     try:
-                        result_str = str(tool_fn.invoke(args))
+                        query = args.get("query")
+                        if fn_name == "search_document" and isinstance(query, list):
+                            queries = [
+                                value.strip()
+                                for value in query
+                                if isinstance(value, str) and value.strip()
+                            ]
+                            if not queries:
+                                result_str = "Tool error (search_document): query list was empty."
+                            else:
+                                result_str = "\n\n".join(
+                                    f"Search query: {item}\n{tool_fn.invoke({'query': item})}"
+                                    for item in dict.fromkeys(queries)
+                                )
+                        else:
+                            result_str = str(tool_fn.invoke(args))
                     except Exception as exc:
                         result_str = f"Tool error ({fn_name}): {exc}"
 
@@ -295,6 +310,12 @@ class DeepAgent:
                         "content": result_str,
                     }
                 )
+
+        if used_tools:
+            msg = await gateway.complete_with_tools(messages, [], purpose="deep_agent")
+            content = (getattr(msg, "content", None) or "").strip() if msg else ""
+            if content:
+                return content, ", ".join(used_tools)
 
         # If this was a document RAG retry and tool-calling failed/was unavailable,
         # return a clean no-match message rather than the operational tool prompt.
