@@ -268,16 +268,7 @@ class DeepAgent:
                     return content, tool_label
                 break
 
-            assistant_msg: dict = {"role": "assistant", "content": msg.content or "", "tool_calls": []}
-            for tc in tool_calls:
-                assistant_msg["tool_calls"].append(
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                )
-            messages.append(assistant_msg)
+            messages.append(msg.model_dump(exclude_none=True))
 
             for tc in tool_calls:
                 fn_name = tc.function.name
